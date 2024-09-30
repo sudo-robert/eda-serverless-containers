@@ -1,4 +1,3 @@
-using System.Collections.Generic;
 using Amazon.CDK;
 using Amazon.CDK.AWS.EC2;
 using Amazon.CDK.AWS.ECS;
@@ -7,8 +6,9 @@ using Amazon.CDK.AWS.Logs;
 using Amazon.CDK.AWS.Pipes;
 using Amazon.CDK.AWS.SQS;
 using Amazon.CDK.AWS.StepFunctions;
+using Amazon.CDK.AWS.StepFunctions.Tasks;
 using Constructs;
-using AssetOptions = Amazon.CDK.AWS.S3.Assets.AssetOptions;
+using System.Collections.Generic;
 using Cluster = Amazon.CDK.AWS.ECS.Cluster;
 using ClusterProps = Amazon.CDK.AWS.ECS.ClusterProps;
 
@@ -124,7 +124,7 @@ namespace EcsSqsTaskRunner
                         SqsQueueParameters = new CfnPipe.PipeSourceSqsQueueParametersProperty
                         {
                             BatchSize = 10,
-                            MaximumBatchingWindowInSeconds = 5
+                            MaximumBatchingWindowInSeconds = 5,
                         }
                     },
                     Target = workflow.StateMachineArn,
@@ -146,19 +146,46 @@ namespace EcsSqsTaskRunner
                 RemovalPolicy = RemovalPolicy.DESTROY,
                 LogGroupName = "EcsTriggerWorkflowLogGroup"
             });
-            
+
+            var ecsTask = new EcsRunTask(this, "RunEcsTask", new EcsRunTaskProps
+            {
+                Cluster = cluster,
+                TaskDefinition = taskDef,
+                LaunchTarget = new EcsFargateLaunchTarget(),
+                SecurityGroups = new ISecurityGroup[] { securityGroup },
+                ContainerOverrides = new[] {
+                    new ContainerOverride
+                    {
+                        ContainerDefinition = taskDef.DefaultContainer,
+                        Environment = new [] {
+                            new TaskEnvironmentVariable { Name = "TestParameter", Value = JsonPath.StringAt("$.TestParameter") }
+                        }
+                    }
+                }
+            });
+
+            var decodeJson = new Pass(this, "DecodeJSON", new PassProps
+            {
+                Parameters = new Dictionary<string, object>
+                {
+                    ["decodedBody.$"] = "States.StringToJson($.[0].body)"
+                },
+                ResultPath = "$"
+            });
+
+            var mapState = new Map(this, "MapState", new MapProps
+            {
+                MaxConcurrency = 5,
+                ItemsPath = "$.decodedBody.items"
+            });
+
+            mapState.Iterator(ecsTask);
+
+            var definition = decodeJson.Next(mapState);
+
             var workflow = new StateMachine(this, "EcsTriggerStateMachine", new StateMachineProps
             {
-                DefinitionBody = DefinitionBody.FromFile("./src/EcsSqsTaskRunner/statemachine/statemachine.asl.json",
-                    new AssetOptions()),
-                DefinitionSubstitutions = new Dictionary<string, string>(2)
-                {
-                    { "SUBNET_1", cluster.Vpc.PublicSubnets[0].SubnetId },
-                    { "SUBNET_2", cluster.Vpc.PublicSubnets[0].SubnetId },
-                    { "SECURITY_GROUP_ID", securityGroup.SecurityGroupId },
-                    { "CLUSTER_NAME", cluster.ClusterName },
-                    { "TASK_DEFINITION", taskDef.TaskDefinitionArn }
-                },
+                Definition = definition,
                 StateMachineType = StateMachineType.EXPRESS,
                 TracingEnabled = true,
                 Logs = new LogOptions
@@ -215,7 +242,7 @@ namespace EcsSqsTaskRunner
                 Family = "dotnet-poller-task-definition",
                 RuntimePlatform = new RuntimePlatform()
                 {
-                    CpuArchitecture = CpuArchitecture.ARM64,
+                    CpuArchitecture = CpuArchitecture.X86_64,
                     OperatingSystemFamily = OperatingSystemFamily.LINUX
                 },
                 NetworkMode = NetworkMode.AWS_VPC,
@@ -234,7 +261,7 @@ namespace EcsSqsTaskRunner
 
             logGroup.GrantWrite(taskExecutionRole);
 
-            taskDef.AddContainer("SampleContainer", new ContainerDefinitionOptions()
+            taskDef.AddContainer("SampleContainer", new Amazon.CDK.AWS.ECS.ContainerDefinitionOptions()
             {
                 Image = ContainerImage.FromAsset("./app/QueueWorker/"),
                 Logging = LogDriver.AwsLogs(new AwsLogDriverProps()
